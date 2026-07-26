@@ -1,0 +1,118 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+
+# Two manually triggered runs must not calculate the same next version.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  check_release:
+    name: Check release status
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.released.outputs.exists }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check whether this commit is already released
+        id: released
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="$(git tag --points-at HEAD | head -n 1)"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            echo "This commit is already released as $RELEASE_TAG; skipping."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: Publish and Release
+    needs: check_release
+    if: needs.check_release.outputs.exists == 'false'
+    runs-on: macos-14
+    environment: prod
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Calculate next CalVer
+        id: version
+        uses: AABelkhiria/next-version@v1
+        with:
+          mode: git-calver
+          calver-reset-policy: monthly
+
+      - name: Update package version
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.new-version }}
+        run: |
+          set -euo pipefail
+
+          sed -i '' -E "s/^version = \"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+          cargo check
+
+          ACTUAL_VERSION="$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')"
+          test "$ACTUAL_VERSION" = "$VERSION"
+
+      - name: Commit release version
+        id: release_commit
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.new-version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): $VERSION"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build project
+        run: cargo build --release --locked
+
+      - name: Verify package
+        run: cargo publish --locked --dry-run
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new-version }}
+          name: Release ${{ steps.version.outputs.new-version }}
+          target_commitish: ${{ steps.release_commit.outputs.sha }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

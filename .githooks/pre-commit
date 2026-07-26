@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+echo "Checking code format with cargo fmt..."
+cargo fmt --all -- --check
+
+echo "Checking code with cargo clippy..."
+cargo clippy --all-targets -- -D warnings
