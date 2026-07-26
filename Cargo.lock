@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "grav-tray"
-version = "26.7.1"
+version = "26.7.3"
 dependencies = [
  "chrono",
  "dirs",
