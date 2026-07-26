@@ -108,12 +108,18 @@ pub fn uninstall_and_stop() -> Result<(), String> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn install_and_start() -> Result<(), String> {
-    Err("grav-tray-rs is a native macOS menu bar application.".to_owned())
+    Err(format!(
+        "{} is a native macOS menu bar application.",
+        env!("CARGO_PKG_NAME")
+    ))
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn uninstall_and_stop() -> Result<(), String> {
-    Err("grav-tray-rs is a native macOS menu bar application.".to_owned())
+    Err(format!(
+        "{} is a native macOS menu bar application.",
+        env!("CARGO_PKG_NAME")
+    ))
 }
 
 fn output_message(output: &Output) -> String {

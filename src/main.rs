@@ -1,7 +1,7 @@
 #[cfg(target_os = "macos")]
 mod macos_app;
 
-use grav_tray_rs::launch_agent;
+use grav_tray::launch_agent;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -21,7 +21,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Version => {
-            println!("grav-tray-rs {}", env!("CARGO_PKG_VERSION"));
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Command::Invalid(argument) => {
@@ -62,7 +62,10 @@ fn run() -> ExitCode {
 
 #[cfg(not(target_os = "macos"))]
 fn run() -> ExitCode {
-    eprintln!("grav-tray-rs is a native macOS menu bar application.");
+    eprintln!(
+        "{} is a native macOS menu bar application.",
+        env!("CARGO_PKG_NAME")
+    );
     ExitCode::FAILURE
 }
 
@@ -82,12 +85,15 @@ fn report(result: Result<(), String>, success_message: &str) -> ExitCode {
 
 #[cfg(not(target_os = "macos"))]
 fn report(_result: Result<(), String>, _success_message: &str) -> ExitCode {
-    eprintln!("grav-tray-rs is a native macOS menu bar application.");
+    eprintln!(
+        "{} is a native macOS menu bar application.",
+        env!("CARGO_PKG_NAME")
+    );
     ExitCode::FAILURE
 }
 
 fn diagnose() -> ExitCode {
-    use grav_tray_rs::quota::{candidate_http_ports, enabled_buckets, fetch_quota};
+    use grav_tray::quota::{candidate_http_ports, enabled_buckets, fetch_quota};
 
     let Some(home) = dirs::home_dir() else {
         eprintln!("Home directory: not found");
@@ -141,11 +147,11 @@ fn print_help() {
         "Grav Tray — Antigravity quota in the macOS menu bar
 
 Usage:
-  grav-tray-rs              Run in the foreground
-  grav-tray-rs --install    Install a LaunchAgent and start Grav Tray
-  grav-tray-rs --uninstall  Stop Grav Tray and remove its LaunchAgent
-  grav-tray-rs --diagnose   Test agy log discovery and quota access
-  grav-tray-rs --version    Print the version
-  grav-tray-rs --help       Show this help"
+  grav-tray              Run in the foreground
+  grav-tray --install    Install a LaunchAgent and start Grav Tray
+  grav-tray --uninstall  Stop Grav Tray and remove its LaunchAgent
+  grav-tray --diagnose   Test agy log discovery and quota access
+  grav-tray --version    Print the version
+  grav-tray --help       Show this help"
     );
 }

@@ -1,4 +1,4 @@
-# Grav Tray RS
+# Grav Tray
 
 A lightweight native macOS menu bar app that shows quota availability for the Google Antigravity CLI (`agy`).
 
@@ -21,8 +21,8 @@ A lightweight native macOS menu bar app that shows quota availability for the Go
 Install the release build from crates.io:
 
 ```sh
-cargo install grav-tray-rs
-grav-tray-rs --install
+cargo install grav-tray
+grav-tray --install
 ```
 
 `--install` creates and starts a per-user LaunchAgent. Grav Tray then runs in the background and starts automatically when you sign in.
@@ -30,22 +30,22 @@ grav-tray-rs --install
 To run it only for the current terminal session:
 
 ```sh
-grav-tray-rs
+grav-tray
 ```
 
 To stop it and disable Launch at Login:
 
 ```sh
-grav-tray-rs --uninstall
+grav-tray --uninstall
 ```
 
 If the menu cannot find `agy`, run the built-in connection check:
 
 ```sh
-grav-tray-rs --diagnose
+grav-tray --diagnose
 ```
 
-Run `grav-tray-rs --uninstall` before `cargo uninstall grav-tray-rs` so no
+Run `grav-tray --uninstall` before `cargo uninstall grav-tray` so no
 stale LaunchAgent remains.
 
 ## Build from source
@@ -71,7 +71,7 @@ Authentication stays inside `agy`. Grav Tray does not read OAuth credentials or 
 Settings are stored at:
 
 ```text
-~/Library/Application Support/grav-tray-rs/config.json
+~/Library/Application Support/grav-tray/config.json
 ```
 
 ## License

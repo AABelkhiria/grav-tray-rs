@@ -51,5 +51,5 @@ impl Settings {
 }
 
 pub fn settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("grav-tray-rs").join("config.json"))
+    dirs::config_dir().map(|directory| directory.join(env!("CARGO_PKG_NAME")).join("config.json"))
 }

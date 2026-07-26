@@ -1,5 +1,5 @@
 [package]
-name = "grav-tray-rs"
+name = "grav-tray"
 version = "26.7.1"
 edition = "2024"
 rust-version = "1.85"

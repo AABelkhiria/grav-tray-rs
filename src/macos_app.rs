@@ -1,36 +1,31 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use grav_tray_rs::launch_agent;
-use grav_tray_rs::quota::{
-    QuotaBucket, QuotaSummary, enabled_buckets, fetch_quota, selected_fraction, selection_key,
+mod ui;
+
+use self::ui::{AppUi, UiState, WIDTH, content_height};
+use grav_tray::launch_agent;
+use grav_tray::quota::{
+    QuotaSummary, enabled_buckets, fetch_quota, selected_fraction, selection_key,
     validate_selection,
 };
-use grav_tray_rs::settings::{Settings, VALID_REFRESH_INTERVALS};
+use grav_tray::settings::{Settings, VALID_REFRESH_INTERVALS};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBox, NSBoxType,
-    NSButton, NSCellImagePosition, NSColor, NSControlSize, NSFont, NSFontWeightRegular, NSImage,
-    NSImageSymbolConfiguration, NSImageSymbolScale, NSImageView, NSLineBreakMode, NSMenu,
-    NSMenuItem, NSPopUpButton, NSPopover, NSPopoverBehavior, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextAlignment,
-    NSTextField, NSTitlePosition, NSVariableStatusItemLength, NSView, NSViewController,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSButton,
+    NSCellImagePosition, NSFontWeightRegular, NSImage, NSImageSymbolConfiguration,
+    NSImageSymbolScale, NSMenu, NSMenuItem, NSPopUpButton, NSPopover, NSPopoverBehavior,
+    NSStatusBar, NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength, NSViewController,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge,
-    NSSize, NSString, NSTimer,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSRectEdge, NSSize, NSString,
+    NSTimer,
 };
 use std::cell::{OnceCell, RefCell};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant, SystemTime};
-
-const WIDTH: f64 = 400.0;
-const PADDING: f64 = 16.0;
-const HEADER_HEIGHT: f64 = 28.0;
-const FOOTER_HEIGHT: f64 = 42.0;
-const SETTINGS_MIN_HEIGHT: f64 = 320.0;
+use std::time::{Duration, Instant};
 
 type FetchResult = Result<(QuotaSummary, u16), String>;
 
@@ -38,8 +33,8 @@ struct AppState {
     _status_item: Retained<NSStatusItem>,
     status_button: Retained<NSStatusBarButton>,
     popover: Retained<NSPopover>,
-    info_popover: Option<Retained<NSPopover>>,
-    view_controller: Retained<NSViewController>,
+    _view_controller: Retained<NSViewController>,
+    ui: AppUi,
     _main_menu: Retained<NSMenu>,
     settings: Settings,
     summary: Option<QuotaSummary>,
@@ -51,6 +46,7 @@ struct AppState {
     last_view_render: Option<Instant>,
     last_quit_attempt: Option<Instant>,
     showing_settings: bool,
+    pending_popover_open: bool,
     loading: bool,
     home_directory: PathBuf,
     sender: Sender<FetchResult>,
@@ -80,16 +76,20 @@ define_class!(
         fn application_did_finish_launching(&self, _notification: &NSNotification) {
             self.finish_launching();
         }
-
-        #[unsafe(method(applicationDidResignActive:))]
-        fn application_did_resign_active(&self, _notification: &NSNotification) {
-            self.close_popovers();
-        }
     }
 
     impl Delegate {
         #[unsafe(method(poll:))]
         fn poll(&self, _timer: &NSTimer) {
+            let should_open = self
+                .ivars()
+                .state
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|state| std::mem::take(&mut state.pending_popover_open));
+            if should_open {
+                self.toggle_popover();
+            }
             self.poll_results();
         }
 
@@ -103,13 +103,13 @@ define_class!(
             if let Some(state) = self.ivars().state.borrow_mut().as_mut() {
                 state.showing_settings = !state.showing_settings;
             }
-            self.rebuild_ui();
+            self.update_ui();
         }
 
         #[unsafe(method(refresh:))]
         fn refresh(&self, _sender: &AnyObject) {
             self.start_refresh();
-            self.rebuild_ui();
+            self.update_ui();
         }
 
         #[unsafe(method(setRefreshInterval:))]
@@ -122,7 +122,7 @@ define_class!(
                 state.settings.refresh_interval_seconds = interval;
                 state.action_error = state.settings.save().err().map(|error| error.to_string());
             }
-            self.rebuild_ui();
+            self.update_ui();
         }
 
         #[unsafe(method(selectMenuBarQuota:))]
@@ -135,7 +135,7 @@ define_class!(
                 state.settings.menu_bar_quota = selection_key(group, bucket);
                 state.action_error = state.settings.save().err().map(|error| error.to_string());
             }
-            self.rebuild_ui();
+            self.update_ui();
         }
 
         #[unsafe(method(toggleLaunchAtLogin:))]
@@ -150,7 +150,7 @@ define_class!(
                     .err()
                     .map(|error| format!("Could not update the login item: {error}"));
             }
-            self.rebuild_ui();
+            self.update_ui();
         }
 
         #[unsafe(method(showInfo:))]
@@ -169,7 +169,9 @@ define_class!(
                     "⌘ 0   : Toggle Settings\n⌘ R   : Refresh Quota\n⌘ Q Q : Quit App",
                 ),
             };
-            self.show_info_popover(sender, title, message);
+            if let Some(state) = self.ivars().state.borrow().as_ref() {
+                state.ui.show_info(sender, title, message);
+            }
         }
 
         #[unsafe(method(quit:))]
@@ -233,14 +235,16 @@ impl Delegate {
 
         let main_menu = self.make_shortcut_menu();
         app.setMainMenu(Some(&main_menu));
+        let ui = AppUi::new(mtm, self);
+        view_controller.setView(ui.root());
 
         let (sender, receiver) = mpsc::channel();
         let state = AppState {
             _status_item: status_item,
             status_button,
             popover,
-            info_popover: None,
-            view_controller,
+            _view_controller: view_controller,
+            ui,
             _main_menu: main_menu,
             settings: Settings::load(),
             summary: None,
@@ -252,6 +256,7 @@ impl Delegate {
             last_view_render: None,
             last_quit_attempt: None,
             showing_settings: false,
+            pending_popover_open: std::env::var_os("GRAV_TRAY_OPEN_ON_LAUNCH").is_some(),
             loading: false,
             home_directory: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
             sender,
@@ -273,11 +278,8 @@ impl Delegate {
             .set(timer)
             .expect("poll timer is initialized once");
 
-        self.rebuild_ui();
+        self.update_ui();
         self.start_refresh();
-        if std::env::var_os("GRAV_TRAY_OPEN_ON_LAUNCH").is_some() {
-            self.toggle_popover();
-        }
     }
 
     fn make_shortcut_menu(&self) -> Retained<NSMenu> {
@@ -307,92 +309,6 @@ impl Delegate {
         main
     }
 
-    fn show_info_popover(&self, sender: &NSButton, title: &str, message: &str) {
-        let mtm = self.mtm();
-        let minimum_width = 190.0;
-        let maximum_width = 280.0;
-        let horizontal_padding = 16.0;
-        let vertical_padding = 16.0;
-        let title_message_gap = 8.0;
-        let maximum_content_width = maximum_width - horizontal_padding * 2.0;
-        let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, maximum_width, 1.0));
-
-        let title_label = add_text(
-            &root,
-            mtm,
-            title,
-            rect(0.0, 0.0, maximum_content_width, 18.0),
-            &NSFont::boldSystemFontOfSize(13.0),
-            &NSColor::labelColor(),
-            NSTextAlignment::Left,
-        );
-        let message_label = add_text(
-            &root,
-            mtm,
-            message,
-            rect(0.0, 0.0, maximum_content_width, 1.0),
-            &NSFont::systemFontOfSize(11.0),
-            &NSColor::secondaryLabelColor(),
-            NSTextAlignment::Left,
-        );
-        message_label.setMaximumNumberOfLines(0);
-        message_label.setUsesSingleLineMode(false);
-        message_label.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
-
-        let natural_content_width = title_label
-            .sizeThatFits(NSSize::new(f64::MAX, f64::MAX))
-            .width
-            .max(
-                message_label
-                    .sizeThatFits(NSSize::new(f64::MAX, f64::MAX))
-                    .width,
-            );
-        let width =
-            (natural_content_width + horizontal_padding * 2.0).clamp(minimum_width, maximum_width);
-        let content_width = width - horizontal_padding * 2.0;
-        message_label.setPreferredMaxLayoutWidth(content_width);
-
-        let title_height = title_label
-            .sizeThatFits(NSSize::new(content_width, f64::MAX))
-            .height
-            .ceil();
-        let message_height = message_label
-            .sizeThatFits(NSSize::new(content_width, f64::MAX))
-            .height
-            .ceil();
-        let height = vertical_padding * 2.0 + title_height + title_message_gap + message_height;
-        root.setFrame(rect(0.0, 0.0, width, height));
-        title_label.setFrame(rect(
-            horizontal_padding,
-            vertical_padding + message_height + title_message_gap,
-            content_width,
-            title_height,
-        ));
-        message_label.setFrame(rect(
-            horizontal_padding,
-            vertical_padding,
-            content_width,
-            message_height,
-        ));
-
-        let view_controller = NSViewController::new(mtm);
-        view_controller.setView(&root);
-        let popover = NSPopover::new(mtm);
-        popover.setBehavior(NSPopoverBehavior::Transient);
-        popover.setAnimates(true);
-        popover.setContentSize(NSSize::new(width, height));
-        popover.setContentViewController(Some(&view_controller));
-        popover.showRelativeToRect_ofView_preferredEdge(sender.bounds(), sender, NSRectEdge::MaxX);
-
-        if let Some(state) = self.ivars().state.borrow_mut().as_mut() {
-            if let Some(previous) = state.info_popover.replace(popover)
-                && previous.isShown()
-            {
-                previous.close();
-            }
-        }
-    }
-
     fn toggle_popover(&self) {
         let is_shown = self
             .ivars()
@@ -405,6 +321,20 @@ impl Delegate {
             return;
         }
 
+        let anchor_ready = self
+            .ivars()
+            .state
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.status_button.window())
+            .is_some_and(|window| window.frame().size.height > 0.0);
+        if !anchor_ready {
+            if let Some(state) = self.ivars().state.borrow_mut().as_mut() {
+                state.pending_popover_open = true;
+            }
+            return;
+        }
+
         let stale = self.ivars().state.borrow().as_ref().is_some_and(|state| {
             state.last_updated.is_none_or(|updated| {
                 updated.elapsed() >= Duration::from_secs(state.settings.refresh_interval_seconds)
@@ -413,7 +343,7 @@ impl Delegate {
         if stale {
             self.start_refresh();
         }
-        self.rebuild_ui();
+        self.update_ui();
 
         if let Some(state) = self.ivars().state.borrow().as_ref() {
             #[allow(deprecated)]
@@ -428,9 +358,7 @@ impl Delegate {
 
     fn close_popovers(&self) {
         if let Some(state) = self.ivars().state.borrow().as_ref() {
-            if let Some(info_popover) = state.info_popover.as_ref() {
-                info_popover.close();
-            }
+            state.ui.close_info();
             state.popover.close();
         }
     }
@@ -505,11 +433,11 @@ impl Delegate {
             self.start_refresh();
         }
         if received_result || refresh_due || view_due {
-            self.rebuild_ui();
+            self.update_ui();
         }
     }
 
-    fn rebuild_ui(&self) {
+    fn update_ui(&self) {
         let mut state_ref = self.ivars().state.borrow_mut();
         let Some(state) = state_ref.as_mut() else {
             return;
@@ -517,597 +445,22 @@ impl Delegate {
 
         update_status_button(state);
         let height = content_height(state);
-        let root = if state.showing_settings {
-            build_settings_view(self.mtm(), state, self, height)
-        } else {
-            build_quota_view(self.mtm(), state, self, height)
+        let ui_state = UiState {
+            settings: &state.settings,
+            summary: state.summary.as_ref(),
+            quota_error: state.quota_error.as_deref(),
+            action_error: state.action_error.as_deref(),
+            last_updated: state.last_updated,
+            showing_settings: state.showing_settings,
+            loading: state.loading,
         };
-        state.view_controller.setView(&root);
-        state.popover.setContentSize(NSSize::new(WIDTH, height));
+        if state.ui.update(ui_state, height) {
+            state
+                .popover
+                .setContentSize(NSSize::new(WIDTH, state.ui.content_height()));
+        }
         state.last_view_render = Some(Instant::now());
     }
-}
-
-fn content_height(state: &AppState) -> f64 {
-    let body = if let Some(summary) = state.summary.as_ref() {
-        let cards: Vec<usize> = summary
-            .groups
-            .iter()
-            .map(|group| {
-                group
-                    .buckets
-                    .iter()
-                    .filter(|bucket| bucket.is_enabled())
-                    .count()
-            })
-            .filter(|count| *count > 0)
-            .collect();
-        let gaps = cards.len().saturating_sub(1) as f64 * 12.0;
-        cards
-            .iter()
-            .map(|count| 38.0 + *count as f64 * 43.0)
-            .sum::<f64>()
-            + gaps
-    } else {
-        84.0
-    };
-    let error = if state.quota_error.is_some() || state.action_error.is_some() {
-        42.0
-    } else {
-        0.0
-    };
-    (PADDING + HEADER_HEIGHT + 14.0 + body + 14.0 + error + FOOTER_HEIGHT + PADDING)
-        .max(SETTINGS_MIN_HEIGHT)
-}
-
-fn build_quota_view(
-    mtm: MainThreadMarker,
-    state: &AppState,
-    target: &Delegate,
-    height: f64,
-) -> Retained<NSView> {
-    let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, height));
-    let header_y = height - PADDING - HEADER_HEIGHT + 6.0;
-    add_header(&root, mtm, state, target, header_y);
-
-    let mut top = header_y - 6.0;
-    if let Some(summary) = state.summary.as_ref() {
-        for group in &summary.groups {
-            let buckets: Vec<_> = group
-                .buckets
-                .iter()
-                .filter(|bucket| bucket.is_enabled())
-                .collect();
-            if buckets.is_empty() {
-                continue;
-            }
-            let card_height = 38.0 + buckets.len() as f64 * 43.0;
-            let bottom = top - card_height;
-            add_rounded_box(
-                &root,
-                mtm,
-                rect(PADDING, bottom, WIDTH - PADDING * 2.0, card_height),
-                &NSColor::secondaryLabelColor().colorWithAlphaComponent(0.05),
-                10.0,
-            );
-            add_text(
-                &root,
-                mtm,
-                &group.display_name,
-                rect(PADDING + 12.0, top - 29.0, 330.0, 18.0),
-                &NSFont::boldSystemFontOfSize(13.0),
-                &NSColor::labelColor(),
-                NSTextAlignment::Left,
-            );
-            let mut row_top = top - 38.0;
-            for bucket in buckets {
-                add_quota_row(&root, mtm, bucket, row_top);
-                row_top -= 43.0;
-            }
-            top = bottom - 12.0;
-        }
-    } else {
-        let bottom = top - 84.0;
-        add_rounded_box(
-            &root,
-            mtm,
-            rect(PADDING, bottom, WIDTH - PADDING * 2.0, 84.0),
-            &NSColor::secondaryLabelColor().colorWithAlphaComponent(0.08),
-            10.0,
-        );
-        add_symbol(
-            &root,
-            mtm,
-            "antenna.radiowaves.left.and.right",
-            rect(PADDING + 12.0, top - 32.0, 18.0, 18.0),
-            &NSColor::labelColor(),
-        );
-        add_text(
-            &root,
-            mtm,
-            "Looking for Antigravity",
-            rect(PADDING + 36.0, top - 32.0, 300.0, 18.0),
-            &NSFont::boldSystemFontOfSize(12.0),
-            &NSColor::labelColor(),
-            NSTextAlignment::Left,
-        );
-        add_text(
-            &root,
-            mtm,
-            "Open agy and make sure you are signed in. Grav Tray connects directly to its local quota service.",
-            rect(PADDING + 12.0, bottom + 10.0, WIDTH - 56.0, 34.0),
-            &NSFont::systemFontOfSize(11.0),
-            &NSColor::secondaryLabelColor(),
-            NSTextAlignment::Left,
-        );
-    }
-
-    if let Some(error) = state
-        .quota_error
-        .as_deref()
-        .or(state.action_error.as_deref())
-    {
-        add_symbol(
-            &root,
-            mtm,
-            "exclamationmark.triangle.fill",
-            rect(PADDING, 50.0, 16.0, 16.0),
-            &NSColor::systemOrangeColor(),
-        );
-        add_text(
-            &root,
-            mtm,
-            error,
-            rect(PADDING + 22.0, 46.0, WIDTH - 54.0, 34.0),
-            &NSFont::systemFontOfSize(10.5),
-            &NSColor::systemOrangeColor(),
-            NSTextAlignment::Left,
-        );
-    }
-
-    add_separator(&root, mtm, 40.0);
-    let refresh = image_text_button(
-        mtm,
-        "Refresh",
-        "arrow.clockwise",
-        sel!(refresh:),
-        target,
-        rect(0.0, 7.0, 92.0, 28.0),
-    );
-    refresh.setEnabled(!state.loading);
-    root.addSubview(&refresh);
-
-    if let Some(updated) = state.last_updated {
-        add_text(
-            &root,
-            mtm,
-            &freshness(updated),
-            rect(WIDTH - 120.0 - PADDING, 12.0, 120.0, 17.0),
-            &NSFont::systemFontOfSize(10.5),
-            &NSColor::secondaryLabelColor(),
-            NSTextAlignment::Right,
-        );
-    }
-    root
-}
-
-fn build_settings_view(
-    mtm: MainThreadMarker,
-    state: &AppState,
-    target: &Delegate,
-    height: f64,
-) -> Retained<NSView> {
-    let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, height));
-    let header_y = height - PADDING - HEADER_HEIGHT + 6.0;
-    add_header(&root, mtm, state, target, header_y);
-    let mut y = header_y - 28.0;
-
-    let general_label = add_text(
-        &root,
-        mtm,
-        "General",
-        rect(PADDING, y, 65.0, 18.0),
-        &NSFont::systemFontOfSize(12.0),
-        &NSColor::secondaryLabelColor(),
-        NSTextAlignment::Left,
-    );
-    let general_width = general_label
-        .sizeThatFits(NSSize::new(f64::MAX, 18.0))
-        .width
-        .ceil();
-    general_label.setFrame(rect(PADDING, y, general_width, 18.0));
-    let info = icon_button(
-        mtm,
-        "info.circle",
-        sel!(showInfo:),
-        target,
-        rect(PADDING + general_width + 2.0, y - 3.0, 24.0, 24.0),
-    );
-    info.setTag(1);
-    root.addSubview(&info);
-    y -= 37.0;
-
-    add_text(
-        &root,
-        mtm,
-        "Refresh interval",
-        rect(PADDING, y + 4.0, 140.0, 18.0),
-        &NSFont::systemFontOfSize(11.0),
-        &NSColor::labelColor(),
-        NSTextAlignment::Left,
-    );
-    let interval_picker = NSPopUpButton::initWithFrame_pullsDown(
-        NSPopUpButton::alloc(mtm),
-        rect(WIDTH - PADDING - 138.0, y, 138.0, 26.0),
-        false,
-    );
-    for interval in VALID_REFRESH_INTERVALS {
-        interval_picker.addItemWithTitle(&NSString::from_str(refresh_interval_label(interval)));
-    }
-    let selected_interval = VALID_REFRESH_INTERVALS
-        .iter()
-        .position(|interval| *interval == state.settings.refresh_interval_seconds)
-        .unwrap_or(1);
-    interval_picker.selectItemAtIndex(selected_interval as isize);
-    unsafe {
-        interval_picker.setTarget(Some(target.as_any_object()));
-        interval_picker.setAction(Some(sel!(setRefreshInterval:)));
-    }
-    root.addSubview(&interval_picker);
-    y -= 38.0;
-
-    add_text(
-        &root,
-        mtm,
-        "Tray quota",
-        rect(PADDING, y + 4.0, 100.0, 18.0),
-        &NSFont::systemFontOfSize(11.0),
-        &NSColor::labelColor(),
-        NSTextAlignment::Left,
-    );
-    let quota_picker = NSPopUpButton::initWithFrame_pullsDown(
-        NSPopUpButton::alloc(mtm),
-        rect(WIDTH - PADDING - 210.0, y, 210.0, 26.0),
-        false,
-    );
-    if let Some(summary) = state.summary.as_ref() {
-        let buckets = enabled_buckets(summary);
-        let mut selected = 0;
-        for (index, (group, bucket)) in buckets.iter().enumerate() {
-            quota_picker.addItemWithTitle(&NSString::from_str(&format!(
-                "{} — {}",
-                group.display_name, bucket.display_name
-            )));
-            if selection_key(group, bucket) == state.settings.menu_bar_quota {
-                selected = index;
-            }
-        }
-        quota_picker.selectItemAtIndex(selected as isize);
-    } else {
-        quota_picker.addItemWithTitle(&NSString::from_str("Waiting for quota data"));
-        quota_picker.setEnabled(false);
-    }
-    unsafe {
-        quota_picker.setTarget(Some(target.as_any_object()));
-        quota_picker.setAction(Some(sel!(selectMenuBarQuota:)));
-    }
-    root.addSubview(&quota_picker);
-
-    let system_y = 52.0;
-    add_separator(&root, mtm, system_y + 54.0);
-    let system_label = add_text(
-        &root,
-        mtm,
-        "System",
-        rect(PADDING, system_y + 24.0, 60.0, 18.0),
-        &NSFont::systemFontOfSize(12.0),
-        &NSColor::secondaryLabelColor(),
-        NSTextAlignment::Left,
-    );
-    let system_width = system_label
-        .sizeThatFits(NSSize::new(f64::MAX, 18.0))
-        .width
-        .ceil();
-    system_label.setFrame(rect(PADDING, system_y + 24.0, system_width, 18.0));
-    let system_info = icon_button(
-        mtm,
-        "info.circle",
-        sel!(showInfo:),
-        target,
-        rect(PADDING + system_width + 2.0, system_y + 22.0, 24.0, 24.0),
-    );
-    system_info.setTag(2);
-    root.addSubview(&system_info);
-    add_text(
-        &root,
-        mtm,
-        "Launch at Login",
-        rect(PADDING, system_y, 150.0, 20.0),
-        &NSFont::systemFontOfSize(12.0),
-        &NSColor::labelColor(),
-        NSTextAlignment::Left,
-    );
-    let launch_checkbox = unsafe {
-        NSButton::checkboxWithTitle_target_action(
-            &NSString::from_str(""),
-            Some(target.as_any_object()),
-            Some(sel!(toggleLaunchAtLogin:)),
-            mtm,
-        )
-    };
-    launch_checkbox.setFrame(rect(WIDTH - PADDING - 20.0, system_y, 20.0, 20.0));
-    launch_checkbox.setState(if launch_agent::is_installed() { 1 } else { 0 });
-    root.addSubview(&launch_checkbox);
-
-    if let Some(error) = state.action_error.as_deref() {
-        add_text(
-            &root,
-            mtm,
-            error,
-            rect(PADDING, system_y - 28.0, WIDTH - PADDING * 2.0, 24.0),
-            &NSFont::systemFontOfSize(10.5),
-            &NSColor::systemOrangeColor(),
-            NSTextAlignment::Left,
-        );
-    }
-
-    add_separator(&root, mtm, 40.0);
-    let quit = image_text_button(
-        mtm,
-        "Quit Grav Tray",
-        "power",
-        sel!(quit:),
-        target,
-        rect(0.0, 7.0, 120.0, 28.0),
-    );
-    quit.setContentTintColor(Some(&NSColor::systemRedColor()));
-    root.addSubview(&quit);
-    let shortcut_info = icon_button(
-        mtm,
-        "info.circle",
-        sel!(showInfo:),
-        target,
-        rect(WIDTH - PADDING - 24.0, 9.0, 24.0, 24.0),
-    );
-    shortcut_info.setTag(3);
-    root.addSubview(&shortcut_info);
-    root
-}
-
-fn add_header(root: &NSView, mtm: MainThreadMarker, state: &AppState, target: &Delegate, y: f64) {
-    add_symbol(
-        root,
-        mtm,
-        "gauge.with.dots.needle.50percent",
-        rect(PADDING, y, 28.0, 28.0),
-        &NSColor::controlAccentColor(),
-    );
-    add_text(
-        root,
-        mtm,
-        "Grav Tray",
-        rect(PADDING + 30.0, y + 3.0, 70.0, 20.0),
-        &NSFont::boldSystemFontOfSize(13.0),
-        &NSColor::labelColor(),
-        NSTextAlignment::Left,
-    );
-    add_text(
-        root,
-        mtm,
-        &format!("v{}", env!("CARGO_PKG_VERSION")),
-        rect(PADDING + 100.0, y + 3.0, 90.0, 17.0),
-        &NSFont::systemFontOfSize(9.5),
-        &NSColor::secondaryLabelColor(),
-        NSTextAlignment::Left,
-    );
-
-    if state.loading {
-        let spinner = NSProgressIndicator::initWithFrame(
-            NSProgressIndicator::alloc(mtm),
-            rect(WIDTH - PADDING - 54.0, y + 5.0, 16.0, 16.0),
-        );
-        spinner.setStyle(NSProgressIndicatorStyle::Spinning);
-        spinner.setControlSize(NSControlSize::Small);
-        spinner.setDisplayedWhenStopped(false);
-        unsafe { spinner.startAnimation(None) };
-        root.addSubview(&spinner);
-    }
-
-    let settings = icon_button(
-        mtm,
-        "gearshape",
-        sel!(toggleSettings:),
-        target,
-        rect(WIDTH - PADDING - 28.0, y, 32.0, 32.0),
-    );
-    settings.setToolTip(Some(&NSString::from_str(if state.showing_settings {
-        "Close Settings"
-    } else {
-        "Settings"
-    })));
-    root.addSubview(&settings);
-}
-
-fn add_quota_row(root: &NSView, mtm: MainThreadMarker, bucket: &QuotaBucket, top: f64) {
-    let fraction = bucket.remaining_fraction.map(|value| value.clamp(0.0, 1.0));
-    let color = progress_color(fraction);
-    add_text(
-        root,
-        mtm,
-        &bucket.display_name,
-        rect(PADDING + 12.0, top - 19.0, 118.0, 17.0),
-        &NSFont::boldSystemFontOfSize(10.5),
-        &NSColor::labelColor(),
-        NSTextAlignment::Left,
-    );
-    add_text(
-        root,
-        mtm,
-        &bucket.reset_label(SystemTime::now()),
-        rect(PADDING + 126.0, top - 19.0, 160.0, 17.0),
-        &NSFont::systemFontOfSize(9.5),
-        &NSColor::secondaryLabelColor(),
-        NSTextAlignment::Left,
-    );
-    let percent_text = bucket
-        .percent()
-        .map(|value| format!("{value}%"))
-        .unwrap_or_else(|| "—".to_owned());
-    add_text(
-        root,
-        mtm,
-        &percent_text,
-        rect(WIDTH - PADDING - 62.0, top - 21.0, 50.0, 20.0),
-        &NSFont::boldSystemFontOfSize(14.0),
-        &color,
-        NSTextAlignment::Right,
-    );
-
-    let track_x = PADDING + 12.0;
-    let track_width = WIDTH - PADDING * 2.0 - 24.0;
-    add_rounded_box(
-        root,
-        mtm,
-        rect(track_x, top - 31.0, track_width, 5.0),
-        &NSColor::secondaryLabelColor().colorWithAlphaComponent(0.14),
-        2.5,
-    );
-    if let Some(fraction) = fraction {
-        add_rounded_box(
-            root,
-            mtm,
-            rect(track_x, top - 31.0, track_width * fraction, 5.0),
-            &color,
-            2.5,
-        );
-    }
-}
-
-fn add_text(
-    root: &NSView,
-    mtm: MainThreadMarker,
-    text: &str,
-    frame: NSRect,
-    font: &NSFont,
-    color: &NSColor,
-    alignment: NSTextAlignment,
-) -> Retained<NSTextField> {
-    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-    label.setFrame(frame);
-    label.setFont(Some(font));
-    label.setTextColor(Some(color));
-    label.setAlignment(alignment);
-    label.setMaximumNumberOfLines(2);
-    root.addSubview(&label);
-    label
-}
-
-fn add_symbol(root: &NSView, mtm: MainThreadMarker, name: &str, frame: NSRect, color: &NSColor) {
-    if let Some(image) = system_image(name) {
-        let image_view = NSImageView::imageViewWithImage(&image, mtm);
-        image_view.setFrame(frame);
-        image_view.setContentTintColor(Some(color));
-        root.addSubview(&image_view);
-    }
-}
-
-fn add_rounded_box(
-    root: &NSView,
-    mtm: MainThreadMarker,
-    frame: NSRect,
-    color: &NSColor,
-    radius: f64,
-) {
-    if frame.size.width <= 0.0 {
-        return;
-    }
-    let background = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
-    background.setBoxType(NSBoxType::Custom);
-    background.setTitlePosition(NSTitlePosition::NoTitle);
-    background.setBorderWidth(0.0);
-    background.setFillColor(color);
-    background.setCornerRadius(radius);
-    root.addSubview(&background);
-}
-
-fn add_separator(root: &NSView, mtm: MainThreadMarker, y: f64) {
-    add_rounded_box(
-        root,
-        mtm,
-        rect(PADDING, y, WIDTH - PADDING * 2.0, 1.0),
-        &NSColor::separatorColor(),
-        0.0,
-    );
-}
-
-fn icon_button(
-    mtm: MainThreadMarker,
-    symbol: &str,
-    action: Sel,
-    target: &Delegate,
-    frame: NSRect,
-) -> Retained<NSButton> {
-    let button = if let Some(image) = system_image(symbol) {
-        unsafe {
-            NSButton::buttonWithTitle_image_target_action(
-                &NSString::from_str(""),
-                &image,
-                Some(target.as_any_object()),
-                Some(action),
-                mtm,
-            )
-        }
-    } else {
-        unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(""),
-                Some(target.as_any_object()),
-                Some(action),
-                mtm,
-            )
-        }
-    };
-    button.setFrame(frame);
-    button.setBordered(false);
-    button.setImagePosition(NSCellImagePosition::ImageOnly);
-    button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-    button
-}
-
-fn image_text_button(
-    mtm: MainThreadMarker,
-    title: &str,
-    symbol: &str,
-    action: Sel,
-    target: &Delegate,
-    frame: NSRect,
-) -> Retained<NSButton> {
-    let button = if let Some(image) = system_image(symbol) {
-        unsafe {
-            NSButton::buttonWithTitle_image_target_action(
-                &NSString::from_str(title),
-                &image,
-                Some(target.as_any_object()),
-                Some(action),
-                mtm,
-            )
-        }
-    } else {
-        unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(title),
-                Some(target.as_any_object()),
-                Some(action),
-                mtm,
-            )
-        }
-    };
-    button.setFrame(frame);
-    button.setBordered(false);
-    button.setImagePosition(NSCellImagePosition::ImageLeading);
-    button.setImageHugsTitle(true);
-    button.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-    button
 }
 
 fn system_image(name: &str) -> Option<Retained<NSImage>> {
@@ -1148,6 +501,18 @@ fn update_status_button(state: &AppState) {
         .setImage(status_image(symbol).as_deref());
 }
 
+fn percent(fraction: f64) -> u8 {
+    (fraction.clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
+fn gauge_symbol(fraction: f64) -> &'static str {
+    match fraction {
+        value if value < 0.11 => "gauge.with.dots.needle.100percent",
+        value if value < 0.31 => "gauge.with.dots.needle.67percent",
+        _ => "gauge.with.dots.needle.33percent",
+    }
+}
+
 fn make_menu_item(
     mtm: MainThreadMarker,
     title: &str,
@@ -1175,50 +540,6 @@ fn add_shortcut(
     let item = make_menu_item(mtm, title, Some(action), key);
     unsafe { item.setTarget(Some(target.as_any_object())) };
     menu.addItem(&item);
-}
-
-fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
-    NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
-}
-
-fn progress_color(fraction: Option<f64>) -> Retained<NSColor> {
-    match fraction {
-        None => NSColor::secondaryLabelColor(),
-        Some(value) if value <= 0.10 => NSColor::systemRedColor(),
-        Some(value) if value <= 0.30 => NSColor::systemOrangeColor(),
-        Some(_) => NSColor::systemGreenColor(),
-    }
-}
-
-fn percent(fraction: f64) -> u8 {
-    (fraction.clamp(0.0, 1.0) * 100.0).round() as u8
-}
-
-fn gauge_symbol(fraction: f64) -> &'static str {
-    match fraction {
-        value if value < 0.11 => "gauge.with.dots.needle.100percent",
-        value if value < 0.31 => "gauge.with.dots.needle.67percent",
-        _ => "gauge.with.dots.needle.33percent",
-    }
-}
-
-fn freshness(updated: Instant) -> String {
-    let elapsed = updated.elapsed().as_secs();
-    match elapsed {
-        0..=9 => "Live".to_owned(),
-        10..=59 => format!("{elapsed}s ago"),
-        _ => format!("{}m ago", elapsed / 60),
-    }
-}
-
-fn refresh_interval_label(seconds: u64) -> &'static str {
-    match seconds {
-        30 => "30 seconds",
-        60 => "1 minute",
-        300 => "5 minutes",
-        900 => "15 minutes",
-        _ => "Custom",
-    }
 }
 
 pub fn run() {
