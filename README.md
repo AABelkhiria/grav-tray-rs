@@ -1,5 +1,9 @@
 # Grav Tray RS
 
+> [!IMPORTANT]
+> `grav-tray-rs` is deprecated and has moved to
+> [`grav-tray`](https://crates.io/crates/grav-tray).
+
 A lightweight native macOS menu bar app that shows quota availability for the Google Antigravity CLI (`agy`).
 
 ## Features

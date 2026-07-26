@@ -1,16 +1,19 @@
 [package]
 name = "grav-tray-rs"
-version = "26.7.1"
+version = "26.7.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Ash <belkhiria.achraf@gmail.com>"]
-description = "Native macOS menu bar quota monitor for the Google Antigravity CLI"
+description = "Deprecated: This crate has moved to grav-tray."
 license = "MIT"
 repository = "https://github.com/AABelkhiria/grav-tray-rs"
 readme = "README.md"
 keywords = ["antigravity", "macos", "menu-bar", "quota", "tray"]
 categories = ["command-line-utilities", "gui"]
 include = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/**"]
+
+[badges]
+maintenance = { status = "deprecated" }
 
 [dependencies]
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }
