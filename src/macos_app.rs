@@ -698,7 +698,7 @@ fn build_settings_view(
     height: f64,
 ) -> Retained<NSView> {
     let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, WIDTH, height));
-    let header_y = height - PADDING - HEADER_HEIGHT;
+    let header_y = height - PADDING - HEADER_HEIGHT + 6.0;
     add_header(&root, mtm, state, target, header_y);
     let mut y = header_y - 28.0;
 

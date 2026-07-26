@@ -168,7 +168,7 @@ fn candidate_http_ports_in(log_directory: &Path) -> Vec<u16> {
             })
         })
         .collect();
-    logs.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    logs.sort_unstable_by_key(|right| std::cmp::Reverse(right.0));
 
     let mut seen = HashSet::new();
     logs.into_iter()
