@@ -247,6 +247,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
 
     #[test]
@@ -310,6 +311,7 @@ mod tests {
     fn calls_connect_rpc_and_decodes_quota() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (response_consumed_tx, response_consumed_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 2048];
@@ -325,14 +327,22 @@ mod tests {
             let body = r#"{"response":{"groups":[{"displayName":"Gemini","buckets":[{"bucketId":"five","displayName":"5-hour","remainingFraction":0.75}]}]}}"#;
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
             .unwrap();
+            stream.flush().unwrap();
+
+            // Keep the peer alive until ureq has consumed the fixed-length body
+            // and reset its socket timeouts. Closing sooner races that reset on
+            // macOS and can make ureq fail with EINVAL.
+            let _ = response_consumed_rx.recv();
         });
 
-        let summary = fetch_from_port(port).unwrap();
+        let summary = fetch_from_port(port);
+        response_consumed_tx.send(()).unwrap();
         server.join().unwrap();
+        let summary = summary.unwrap();
         assert_eq!(summary.groups[0].display_name, "Gemini");
         assert_eq!(summary.groups[0].buckets[0].percent(), Some(75));
     }
