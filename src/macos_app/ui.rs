@@ -15,6 +15,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     MainThreadMarker, NSEdgeInsets, NSPoint, NSRect, NSRectEdge, NSSize, NSString,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Instant, SystemTime};
 
@@ -86,8 +87,9 @@ struct QuotaRowViews {
     name: Retained<NSTextField>,
     reset: Retained<NSTextField>,
     percent: Retained<NSTextField>,
+    track: Retained<NSBox>,
     fill: Retained<NSBox>,
-    fill_width: Retained<NSLayoutConstraint>,
+    fill_width: RefCell<Retained<NSLayoutConstraint>>,
 }
 
 struct SettingsPageViews {
@@ -567,7 +569,9 @@ impl QuotaRowViews {
         fill.bottomAnchor()
             .constraintEqualToAnchor(&track.bottomAnchor())
             .setActive(true);
-        let fill_width = fill.widthAnchor().constraintEqualToConstant(0.0);
+        let fill_width = fill
+            .widthAnchor()
+            .constraintEqualToAnchor_multiplier(&track.widthAnchor(), 0.0);
         fill_width.setActive(true);
 
         root.addArrangedSubview(&labels);
@@ -580,8 +584,9 @@ impl QuotaRowViews {
             name,
             reset,
             percent,
+            track,
             fill,
-            fill_width,
+            fill_width: RefCell::new(fill_width),
         }
     }
 
@@ -601,10 +606,13 @@ impl QuotaRowViews {
         self.percent.setTextColor(Some(&color));
         self.fill.setFillColor(&color);
         self.fill.setHidden(fraction.is_none());
-        self.fill_width.setConstant(
-            (WIDTH - HORIZONTAL_PADDING * 2.0 - CONTENT_HORIZONTAL_PADDING * 2.0 - 24.0)
-                * fraction.unwrap_or(0.0),
-        );
+        let fill_width = self
+            .fill
+            .widthAnchor()
+            .constraintEqualToAnchor_multiplier(&self.track.widthAnchor(), fraction.unwrap_or(0.0));
+        let old_fill_width = self.fill_width.replace(fill_width);
+        old_fill_width.setActive(false);
+        self.fill_width.borrow().setActive(true);
     }
 }
 
